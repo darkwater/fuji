@@ -1,4 +1,4 @@
-#![feature(type_ascription, never_type, specialization)]
+#![feature(concat_idents, type_ascription, never_type, specialization)]
 
 use log::debug;
 use log::error;
@@ -449,9 +449,44 @@ pub struct Fuji {
     swapchain_images: Option<Vec<Arc<SwapchainImage<Window>>>>,
 }
 
+macro_rules! getters {
+    ( full: $field:ident : $type:ty : $body:expr, $body_mut:expr ) => {
+        paste::item! {
+            pub fn $field(&self) -> &$type {
+                $body
+            }
+
+            pub fn [<$field _mut>](&mut self) -> &mut $type {
+                $body_mut
+            }
+        }
+    };
+
+    ( $field:ident : $type:ty , $($extra:tt)* ) => {
+        getters!{ full: $field : $type : { &self.$field }, { &mut self.$field }}
+        getters!{ $($extra)* }
+    };
+
+    ( $field:ident : opt $type:ty , $($extra:tt)* ) => {
+        getters!{ full: $field : $type : { self.$field.as_ref().unwrap() }, { self.$field.as_mut().unwrap() }}
+        getters!{ $($extra)* }
+    };
+
+    () => {};
+}
+
 impl Fuji {
-    pub fn instance(&self) -> &Arc<Instance> {
-        &self.instance
+    getters! {
+        instance:         Arc<Instance>,
+        debug_callback:   opt DebugCallback,
+        events_loop:      opt EventsLoop,
+        surface:          opt Arc<Surface<Window>>,
+        physical_device:  PhysicalDeviceFacade,
+        device:           Arc<Device>,
+        graphics_queue:   opt Arc<Queue>,
+        present_queue:    opt Arc<Queue>,
+        swapchain:        opt Arc<Swapchain<Window>>,
+        swapchain_images: opt Vec<Arc<SwapchainImage<Window>>>,
     }
 
     pub fn create_swapchain(&mut self) {
