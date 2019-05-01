@@ -6,19 +6,23 @@ use log::info;
 use log::warn;
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::fmt;
 use std::iter::FromIterator;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::RwLock;
 use vulkano::buffer::BufferAccess;
-use vulkano::buffer::TypedBufferAccess;
+use vulkano::command_buffer::AutoCommandBufferBuilder;
+use vulkano::command_buffer::DrawError;
+use vulkano::command_buffer::DynamicState;
 use vulkano::device::Device;
 use vulkano::device::DeviceCreationError;
 use vulkano::device::DeviceExtensions;
 use vulkano::device::Features;
 use vulkano::device::Queue;
 use vulkano::format::Format;
+use vulkano::framebuffer::Framebuffer;
 use vulkano::framebuffer::FramebufferAbstract;
+use vulkano::framebuffer::RenderPassAbstract;
 use vulkano::image::ImageUsage;
 use vulkano::image::swapchain::SwapchainImage;
 use vulkano::instance::ApplicationInfo;
@@ -28,6 +32,8 @@ use vulkano::instance::PhysicalDevice;
 use vulkano::instance::RawInstanceExtensions;
 use vulkano::instance::debug::DebugCallback;
 use vulkano::instance::debug::MessageTypes;
+use vulkano::pipeline::GraphicsPipelineAbstract;
+use vulkano::pipeline::viewport::Viewport;
 use vulkano::swapchain::Capabilities;
 use vulkano::swapchain::ColorSpace;
 use vulkano::swapchain::CompositeAlpha;
@@ -310,7 +316,7 @@ impl FujiDeviceBuilder {
         }
     }
 
-    pub fn build(mut self) -> Result<Fuji, DeviceCreationError> {
+    pub fn build(mut self) -> Result<Arc<Fuji>, DeviceCreationError> {
         let physical_device = self.pick_physical_device();
         let device          = self.create_logical_device(physical_device.get())?;
 
@@ -318,7 +324,14 @@ impl FujiDeviceBuilder {
             .map(|(e, s)| (Some(e), Some(s)))
             .unwrap_or((None, None));
 
-        let mut fuji = Fuji {
+        let surface_format = surface.as_ref().map(|surface| {
+            let capabilities = surface.capabilities(physical_device.get()).expect("surface capabilities");
+            Self::choose_swap_surface_format(&capabilities.supported_formats)
+        });
+
+        let events_loop = RwLock::new(events_loop);
+
+        let fuji = Fuji {
             instance:       self.instance,
             debug_callback: self.debug_callback,
 
@@ -329,15 +342,11 @@ impl FujiDeviceBuilder {
             graphics_queue: self.graphics_queue.into(),
             present_queue:  self.present_queue.into(),
 
-            swapchain:        None,
-            swapchain_images: None,
+            surface_format,
+            swapchain: RwLock::new(None),
         };
 
-        if fuji.surface.is_some() {
-            fuji.create_swapchain();
-        }
-
-        Ok(fuji)
+        Ok(fuji.into())
     }
 
     fn pick_physical_device(&self) -> PhysicalDeviceFacade {
@@ -380,6 +389,17 @@ impl FujiDeviceBuilder {
         let device_extensions = self.device_extensions();
 
         available_extensions.intersection(&device_extensions) == device_extensions
+    }
+
+    fn choose_swap_surface_format(available_formats: &[ (Format, ColorSpace) ]) -> Format {
+        // NOTE: the 'preferred format' mentioned in the tutorial doesn't seem to be
+        // queryable in Vulkano (no VK_FORMAT_UNDEFINED enum)
+
+        *available_formats.iter().find(|(format, color_space)| {
+            *format == Format::B8G8R8A8Unorm && *color_space == ColorSpace::SrgbNonLinear
+        })
+        .map(|(format, _color_space)| format)
+        .unwrap_or_else(|| &available_formats[0].0)
     }
 
     fn find_queue_families(&self, device: PhysicalDevice) -> QueueFamilyIndices {
@@ -426,7 +446,7 @@ impl FujiDeviceBuilder {
         let queues: Vec<_> = queues.collect();
 
         self.graphics_queue.resolve(|| queues.iter().find(|q| q.family().id() == indices.graphics_family.cloned().unwrap()).unwrap().clone());
-        self.present_queue.resolve(|| queues.iter().find(|q| q.family().id() == indices.present_family.cloned().unwrap()).unwrap().clone());
+        self.present_queue.resolve(||  queues.iter().find(|q| q.family().id() == indices.present_family.cloned().unwrap()).unwrap().clone());
 
         Ok(device)
     }
@@ -436,7 +456,7 @@ pub struct Fuji {
     instance:       Arc<Instance>,
     debug_callback: Option<DebugCallback>,
 
-    events_loop: Option<EventsLoop>,
+    events_loop: RwLock<Option<EventsLoop>>,
     surface:     Option<Arc<Surface<Window>>>,
 
     physical_device: PhysicalDeviceFacade,
@@ -445,30 +465,43 @@ pub struct Fuji {
     graphics_queue: Option<Arc<Queue>>,
     present_queue:  Option<Arc<Queue>>,
 
-    swapchain:        Option<Arc<Swapchain<Window>>>,
-    swapchain_images: Option<Vec<Arc<SwapchainImage<Window>>>>,
+    surface_format: Option<Format>,
+    swapchain:      RwLock<Option<Arc<SwapchainBundle>>>,
+}
+
+pub struct SwapchainBundle {
+    pub swapchain:    Arc<Swapchain<Window>>,
+    pub images:       Vec<Arc<SwapchainImage<Window>>>,
+    pub framebuffers: Vec<Arc<dyn FramebufferAbstract + Send + Sync>>,
+    pub viewport:     Viewport,
 }
 
 macro_rules! getters {
-    ( full: $field:ident : $type:ty : $body:expr, $body_mut:expr ) => {
-        paste::item! {
-            pub fn $field(&self) -> &$type {
-                $body
-            }
-
-            pub fn [<$field _mut>](&mut self) -> &mut $type {
-                $body_mut
-            }
-        }
-    };
-
     ( $field:ident : $type:ty , $($extra:tt)* ) => {
-        getters!{ full: $field : $type : { &self.$field }, { &mut self.$field }}
+        pub fn $field(&self) -> &$type {
+            &self.$field
+        }
+
         getters!{ $($extra)* }
     };
 
     ( $field:ident : opt $type:ty , $($extra:tt)* ) => {
-        getters!{ full: $field : $type : { self.$field.as_ref().unwrap() }, { self.$field.as_mut().unwrap() }}
+        pub fn $field(&self) -> &$type {
+            &self.$field.as_ref().unwrap()
+        }
+
+        getters!{ $($extra)* }
+    };
+
+    // `gen` for generation
+    //
+    // A `RwLock<Option<Arc<T>>>` that we only mutate ourselves by replacing it with a new Arc<T>, and
+    // only give out clones of the `Arc<T>`.
+    ( $field:ident : opt gen $type:ty , $($extra:tt)* ) => {
+        pub fn $field(&self) -> $type {
+            self.$field.read().unwrap().as_ref().unwrap().clone()
+        }
+
         getters!{ $($extra)* }
     };
 
@@ -477,24 +510,25 @@ macro_rules! getters {
 
 impl Fuji {
     getters! {
-        instance:         Arc<Instance>,
-        debug_callback:   opt DebugCallback,
-        events_loop:      opt EventsLoop,
-        surface:          opt Arc<Surface<Window>>,
-        physical_device:  PhysicalDeviceFacade,
-        device:           Arc<Device>,
-        graphics_queue:   opt Arc<Queue>,
-        present_queue:    opt Arc<Queue>,
-        swapchain:        opt Arc<Swapchain<Window>>,
-        swapchain_images: opt Vec<Arc<SwapchainImage<Window>>>,
+        instance:        Arc<Instance>,
+        debug_callback:  opt DebugCallback,
+        surface:         opt Arc<Surface<Window>>,
+        physical_device: PhysicalDeviceFacade,
+        device:          Arc<Device>,
+        graphics_queue:  opt Arc<Queue>,
+        present_queue:   opt Arc<Queue>,
+        surface_format:  opt Format,
+        swapchain:       opt gen Arc<SwapchainBundle>,
     }
 
-    pub fn create_swapchain(&mut self) {
-        let capabilities = self.surface.as_ref().unwrap().capabilities(self.physical_device.get()).expect("surface capabilities");
+    pub fn take_events_loop(&self) -> Option<EventsLoop> {
+        self.events_loop.write().unwrap().take()
+    }
 
-        let surface_format = Self::choose_swap_surface_format(&capabilities.supported_formats);
+    pub fn create_swapchain(&self, render_pass: &Arc<dyn RenderPassAbstract + Send + Sync>) {
+        let capabilities = self.surface().capabilities(self.physical_device.get()).expect("surface capabilities");
         let present_mode = Self::choose_swap_present_mode(capabilities.present_modes);
-        let extent = Self::choose_swap_extent(&capabilities);
+        let extent       = Self::choose_swap_extent(&capabilities);
 
         let mut image_count = capabilities.min_image_count + 1;
         if capabilities.max_image_count.map(|max| image_count > max).unwrap_or(false) {
@@ -515,11 +549,14 @@ impl Fuji {
             self.graphics_queue.as_ref().unwrap().into()
         };
 
+        let old_swapchain_lock = self.swapchain.read().unwrap();
+        let old_swapchain = old_swapchain_lock.as_ref().map(|s| &s.swapchain);
+
         let (swapchain, images) = Swapchain::new(
             self.device.clone(),
             self.surface.as_ref().unwrap().clone(),
             image_count,
-            surface_format.0, // TODO: color space?
+            self.surface_format.unwrap(), // TODO: color space?
             extent,
             1, // layers
             image_usage,
@@ -528,21 +565,31 @@ impl Fuji {
             CompositeAlpha::Opaque,
             present_mode,
             true, // clipped
-            self.swapchain.as_ref(),
+            old_swapchain,
         ).expect("swap chain");
 
-        self.swapchain        = Some(swapchain);
-        self.swapchain_images = Some(images);
-    }
+        drop(old_swapchain_lock);
 
-    fn choose_swap_surface_format(available_formats: &[ (Format, ColorSpace) ]) -> (Format, ColorSpace) {
-        // NOTE: the 'preferred format' mentioned in the tutorial doesn't seem to be
-        // queryable in Vulkano (no VK_FORMAT_UNDEFINED enum)
+        let framebuffers = images.iter()
+            .map(|image| -> Arc<dyn FramebufferAbstract + Send + Sync> {
+                Arc::new(Framebuffer::start(render_pass.clone())
+                         .add(image.clone()).unwrap()
+                         .build().unwrap())
+            })
+            .collect::<Vec<_>>();
 
-        *available_formats.iter().find(|(format, color_space)| {
-            *format == Format::B8G8R8A8Unorm && *color_space == ColorSpace::SrgbNonLinear
-        })
-        .unwrap_or_else(|| &available_formats[0])
+        let dimensions = images[0].dimensions();
+        let dimensions = [ dimensions[0] as f32, dimensions[1] as f32 ];
+        let viewport = Viewport {
+            origin: [ 0.0, 0.0 ],
+            dimensions,
+            depth_range: 0.0 .. 1.0,
+        };
+
+        let mut bundle = self.swapchain.write().unwrap();
+        *bundle = Some(Arc::new(SwapchainBundle {
+            swapchain, images, framebuffers, viewport,
+        }));
     }
 
     fn choose_swap_present_mode(available_present_modes: SupportedPresentModes) -> PresentMode {
@@ -569,19 +616,26 @@ impl Fuji {
     }
 }
 
-impl fmt::Debug for Fuji {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Fuji")
-            .field("instance",                 &self.instance)
-            .field("debug_callback as *const", &self.debug_callback.as_ref().map(|v| v as *const _ as usize))
-            .field("events_loop",              &self.events_loop)
-            .field("surface",                  &self.surface)
-            .field("physical_device index",    &self.physical_device.1)
-            .field("device",                   &self.device)
-            .field("graphics_queue",           &self.graphics_queue)
-            .field("present_queue",            &self.present_queue)
-            .field("swapchain",                &self.swapchain)
-            .field("swapchain_images length",  &self.swapchain_images.as_ref().map(|v| v.len()))
-            .finish()
+pub trait Drawable {
+    fn pipeline(&self) -> Arc<dyn GraphicsPipelineAbstract + Send + Sync + 'static>;
+    fn dynamic_state(&self) -> DynamicState;
+    fn vertex_buffers(&self) -> Vec<Arc<dyn BufferAccess + Send + Sync + 'static>>;
+    fn descriptor_sets(&self) -> ();
+    fn push_constants(&self) -> ();
+}
+
+pub trait CommandBufferBuilderExt: Sized {
+    fn fuji_draw<T: Drawable>(self, obj: &T) -> Result<Self, DrawError>;
+}
+
+impl CommandBufferBuilderExt for AutoCommandBufferBuilder {
+    fn fuji_draw<T: Drawable>(self, obj: &T) -> Result<Self, DrawError> {
+        self.draw(
+            obj.pipeline(),
+            &obj.dynamic_state(),
+            obj.vertex_buffers(),
+            obj.descriptor_sets(),
+            obj.push_constants(),
+        )
     }
 }
